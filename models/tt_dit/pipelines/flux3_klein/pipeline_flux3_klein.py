@@ -19,6 +19,7 @@ from PIL import Image, ImageOps
 import ttnn
 
 from ...encoders.qwen3vl.loader_flux3_klein import build_flux3_klein_text_encoder
+from ...models.transformers.flux3_klein.transformer_block_flux3_klein import PRECISION_BF16, Flux3KleinPrecision
 from ...models.transformers.flux3_klein.transformer_flux3_klein import (
     EARLY_DEPTH,
     IN_CHANNELS,
@@ -198,6 +199,7 @@ class Flux3KleinPipeline:
         topology: ttnn.Topology = ttnn.Topology.Ring,
         num_links: int = 2,
         upsample: bool = False,
+        precision: Flux3KleinPrecision = PRECISION_BF16,
     ) -> None:
         """With ``upsample``, the prompt upsampler shares the first chip of ``mesh_device``, which must be opened
         with upsampler_flux3_klein.SHARED_MESH_PARAMS, and every prompt is rewritten before it is encoded."""
@@ -234,6 +236,7 @@ class Flux3KleinPipeline:
                 ccl_manager=self._ccl,
                 parallel_config=parallel,
                 linear1=topology == ttnn.Topology.Ring,
+                precision=precision,
             )
             cache.load_model(
                 transformer,
@@ -243,6 +246,7 @@ class Flux3KleinPipeline:
                 mesh_shape=mesh_shape,
                 mesh_device=mesh_device,
                 get_torch_state_dict=lambda snapshot=snapshot: _load_dit_state(snapshot),
+                dtype=precision.name,
             )
             self._transformers[model] = transformer
 

@@ -21,7 +21,7 @@ from ....parallel.manager import CCLManager
 from ....utils import tensor
 from ....utils.matmul import FusedMMRSConfig, register_fused_mmrs_configs, register_matmul_configs
 from ....utils.substate import rename_substate
-from .transformer_block_flux3_klein import HIDDEN, Flux3KleinTransformerBlock
+from .transformer_block_flux3_klein import HIDDEN, PRECISION_BF16, Flux3KleinPrecision, Flux3KleinTransformerBlock
 
 MODES = ("image", "image_cond", "text")
 IN_CHANNELS = {"image": 128, "image_cond": 128, "text": 20480}
@@ -246,7 +246,13 @@ def gather_rows_over_sp(x: ttnn.Tensor, indices: ttnn.Tensor, *, ccl_manager: CC
 
 class Flux3KleinModulation(Module):
     def __init__(
-        self, *, flow_map: bool, device: ttnn.MeshDevice, ccl_manager: CCLManager, parallel_config: DiTParallelConfig
+        self,
+        *,
+        flow_map: bool,
+        device: ttnn.MeshDevice,
+        ccl_manager: CCLManager,
+        parallel_config: DiTParallelConfig,
+        precision: Flux3KleinPrecision = PRECISION_BF16,
     ) -> None:
         super().__init__()
         self.device = device
@@ -268,10 +274,13 @@ class Flux3KleinModulation(Module):
             HIDDEN,
             MOD_CHUNKS * HIDDEN,
             bias=True,
+            dtype=precision.weight_dtype,
+            bias_dtype=ttnn.bfloat16,
             mesh_device=device,
             mesh_axis=parallel_config.tensor_parallel.mesh_axis,
             ccl_manager=ccl_manager,
             chunks=MOD_CHUNKS,
+            compute_kernel_config=precision.matmul_config(device.arch()),
         )
         self._row_mask = None
         self.register_eviction_hook(self._release_row_mask)
@@ -330,6 +339,7 @@ class Flux3KleinEarlyStacks(Module):
         parallel_config: DiTParallelConfig,
         is_fsdp: bool,
         linear1: bool,
+        precision: Flux3KleinPrecision = PRECISION_BF16,
     ) -> None:
         super().__init__()
         self._ring = ccl_manager.topology == ttnn.Topology.Ring
@@ -344,6 +354,7 @@ class Flux3KleinEarlyStacks(Module):
                         parallel_config=parallel_config,
                         is_fsdp=is_fsdp,
                         linear1=linear1,
+                        precision=precision,
                     )
                     for _ in range(EARLY_DEPTH)
                 ),
@@ -412,6 +423,7 @@ class Flux3KleinTransformer(Module):
         parallel_config: DiTParallelConfig,
         is_fsdp: bool = False,
         linear1: bool = False,
+        precision: Flux3KleinPrecision = PRECISION_BF16,
     ) -> None:
         super().__init__()
         tp_axis = parallel_config.tensor_parallel.mesh_axis
@@ -432,10 +444,19 @@ class Flux3KleinTransformer(Module):
         self.emb_in_image = embedding("image")
         self.emb_in_image_cond = embedding("image_cond")
         self.modulation = Flux3KleinModulation(
-            flow_map=flow_map, device=device, ccl_manager=ccl_manager, parallel_config=parallel_config
+            flow_map=flow_map,
+            device=device,
+            ccl_manager=ccl_manager,
+            parallel_config=parallel_config,
+            precision=precision,
         )
         self.early = Flux3KleinEarlyStacks(
-            device=device, ccl_manager=ccl_manager, parallel_config=parallel_config, is_fsdp=is_fsdp, linear1=linear1
+            device=device,
+            ccl_manager=ccl_manager,
+            parallel_config=parallel_config,
+            is_fsdp=is_fsdp,
+            linear1=linear1,
+            precision=precision,
         )
         self.single_blocks = ModuleList(
             Flux3KleinTransformerBlock(
@@ -444,6 +465,7 @@ class Flux3KleinTransformer(Module):
                 parallel_config=parallel_config,
                 is_fsdp=is_fsdp,
                 linear1=linear1,
+                precision=precision,
             )
             for _ in range(SINGLE_DEPTH)
         )

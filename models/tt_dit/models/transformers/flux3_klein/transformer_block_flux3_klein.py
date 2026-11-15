@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 
 import ttnn
@@ -66,6 +68,28 @@ LINEAR1_MIN_ROWS = 8192
 LINEAR1_MIN_ROWS_SP32 = 2048
 
 
+@dataclass(frozen=True)
+class Flux3KleinPrecision:
+    """Weight dtype and matmul fidelity of every DiT block and modulation linear; ``name`` keys the weight cache.
+    ``mm_fidelity`` None keeps each layer's own matmul config."""
+
+    name: str
+    weight_dtype: ttnn.DataType = ttnn.bfloat16
+    mm_fidelity: ttnn.MathFidelity | None = None
+
+    def matmul_config(self, arch: ttnn.Arch) -> ttnn.WormholeComputeKernelConfig | None:
+        if self.mm_fidelity is None:
+            return None
+        return ttnn.init_device_compute_kernel_config(
+            arch, math_fidelity=self.mm_fidelity, math_approx_mode=False, fp32_dest_acc_en=True, packer_l1_acc=True
+        )
+
+
+PRECISION_BF16 = Flux3KleinPrecision("bf16")
+# opt-in fast mode: bfloat8_b weights, LoFi matmuls (activations stay bf16)
+PRECISION_FAST = Flux3KleinPrecision("bf8_lofi", ttnn.bfloat8_b, ttnn.MathFidelity.LoFi)
+
+
 class Flux3KleinAttention(Attention):
     """Ring SDPA on the streaming compute path with fp32 dest accumulation (bf16 score block), also on the CCL row's
     cores from RING_SDPA_CCL_ROW_START_X on, with RING_SDPA_CHUNKS_BY_LOCAL_ROWS's chunks where it has the rows."""
@@ -106,6 +130,7 @@ class Flux3KleinTransformerBlock(Module):
         parallel_config: DiTParallelConfig,
         is_fsdp: bool = False,
         linear1: bool = False,
+        precision: Flux3KleinPrecision = PRECISION_BF16,
     ) -> None:
         super().__init__()
         if linear1 and (is_fsdp or ccl_manager.topology != ttnn.Topology.Ring):
@@ -116,6 +141,7 @@ class Flux3KleinTransformerBlock(Module):
         tp_axis = parallel_config.tensor_parallel.mesh_axis
         mlp_hidden_dim = MLP_RATIO * HIDDEN
         fsdp_mesh_axis = parallel_config.sequence_parallel.mesh_axis if is_fsdp else None
+        mm_config = precision.matmul_config(device.arch())
 
         self.attn = Flux3KleinAttention(
             query_dim=HIDDEN,
@@ -137,6 +163,8 @@ class Flux3KleinTransformerBlock(Module):
             ring_sdpa_q_chunk_max=128,
             ring_sdpa_exp_approx=True,
             sdpa_fp32_dest_acc=True,
+            qkv_dtype=precision.weight_dtype,
+            mm_compute_kernel_config=mm_config,
         )
 
         self.norm = DistributedLayerNorm(
@@ -153,6 +181,8 @@ class Flux3KleinTransformerBlock(Module):
             mlp_hidden_dim,
             bias=False,
             activation_fn="swiglu",
+            dtype=precision.weight_dtype,
+            compute_kernel_config=mm_config,
             mesh_device=device,
             mesh_axis=tp_axis,
             fsdp_mesh_axis=fsdp_mesh_axis,
@@ -162,6 +192,8 @@ class Flux3KleinTransformerBlock(Module):
             HIDDEN + mlp_hidden_dim,
             HIDDEN,
             bias=False,
+            dtype=precision.weight_dtype,
+            compute_kernel_config=mm_config,
             mesh_device=device,
             mesh_axis=tp_axis,
             ccl_manager=ccl_manager,
