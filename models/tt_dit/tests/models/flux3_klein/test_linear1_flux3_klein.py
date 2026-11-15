@@ -4,7 +4,8 @@
 
 """FLUX 3 Klein's linear1 (QKV + MLP-in as one all-gather matmul, swiglu_last_chunk + grouped N) at the 4096 row counts:
 its q / k / v / MLP outputs must be byte-identical to the separate to_qkv and proj_mlp calls, and a block with
-linear1 (and the TP barrier before proj_out) byte-identical to the same block without it, call after call."""
+linear1 (and the TP barrier before proj_out) byte-identical to the same block without it, call after call. Also in
+the fast mode (PRECISION_FAST)."""
 
 from __future__ import annotations
 
@@ -15,7 +16,12 @@ import ttnn
 
 from ....blocks.attention_opt import Attention
 from ....models.transformers.flux3_klein import transformer_flux3_klein as klein
-from ....models.transformers.flux3_klein.transformer_block_flux3_klein import Flux3KleinTransformerBlock
+from ....models.transformers.flux3_klein.transformer_block_flux3_klein import (
+    PRECISION_BF16,
+    PRECISION_FAST,
+    Flux3KleinPrecision,
+    Flux3KleinTransformerBlock,
+)
 from ....parallel.config import DiTGParallelConfigNoCFG, ParallelFactor
 from ....parallel.manager import CCLManager
 from ....utils import tensor
@@ -51,7 +57,8 @@ def _same(a: ttnn.Tensor | list[torch.Tensor], b: ttnn.Tensor | list[torch.Tenso
 
 @pytest.mark.parametrize("device_params", [{**ring_params_8k, "l1_small_size": 65536}], indirect=True)
 @pytest.mark.parametrize("mesh_device", [(TP, SP)], indirect=True)
-def test_linear1(*, mesh_device: ttnn.MeshDevice) -> None:
+@pytest.mark.parametrize("precision", [PRECISION_BF16, PRECISION_FAST], ids=["bf16", "fast"])
+def test_linear1(*, mesh_device: ttnn.MeshDevice, precision: Flux3KleinPrecision) -> None:
     tp_axis, sp_axis = 0, 1
     ccl = CCLManager(mesh_device=mesh_device, num_links=2, topology=ttnn.Topology.Ring)
     parallel = DiTGParallelConfigNoCFG(
@@ -62,12 +69,19 @@ def test_linear1(*, mesh_device: ttnn.MeshDevice) -> None:
     blocks = {}
     for linear1 in (False, True):
         block = Flux3KleinTransformerBlock(
-            device=mesh_device, ccl_manager=ccl, parallel_config=parallel, linear1=linear1
+            device=mesh_device, ccl_manager=ccl, parallel_config=parallel, linear1=linear1, precision=precision
         )
         missing = block.load_torch_state_dict(dict(state), strict=False).missing_keys
         assert not missing, missing
         blocks[linear1] = block
     plain, fused_block = blocks[False], blocks[True]
+    for block in blocks.values():
+        attn = block.attn
+        assert attn.to_qkv.weight.data.dtype == block.proj_mlp.weight.data.dtype == precision.weight_dtype
+        assert block.proj_out.weight.data.dtype == precision.weight_dtype
+        if precision.mm_fidelity is not None:
+            for config in (attn.mm_compute_kernel_config, block.proj_mlp.compute_config, block.proj_out.compute_config):
+                assert config.math_fidelity == precision.mm_fidelity
     full = mesh_device.compute_with_storage_grid_size()
     gen = torch.Generator().manual_seed(1)
 
