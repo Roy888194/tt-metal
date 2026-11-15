@@ -180,6 +180,7 @@ def image_rows(image: ttnn.Tensor) -> ttnn.Tensor:
 
 
 def rows_to_uint8(x: ttnn.Tensor) -> ttnn.Tensor:
+    x = ttnn.to_layout(x, ttnn.ROW_MAJOR_LAYOUT)
     x = ttnn.typecast(x, ttnn.float32)
     x = ttnn.add(x, 1.0)
     x = ttnn.multiply(x, 127.5)
