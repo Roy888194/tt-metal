@@ -34,11 +34,36 @@ RING_SDPA_CHUNKS_BY_LOCAL_ROWS: dict[int, tuple[int, int]] = {
     8320: (224, 512),
     8960: (160, 512),
 }
+# The same at SP32 x TP4 (a quad of Galaxies): q 128 puts every (head, q chunk) unit in one round of the 12 x 9 grid,
+# so the CCL row's cores add nothing there; k divides the per-chip K shard of a ring step (or pads it by at most 7 %).
+RING_SDPA_CHUNKS_SP32_BY_LOCAL_ROWS: dict[int, tuple[int, int]] = {
+    2048: (128, 512),  # 4096x4096 image early stacks
+    2080: (128, 448),  # 4096x4096, 1024-row text bucket
+    2112: (128, 704),  # 2048-row text bucket
+    2176: (128, 576),  # 4096-row text bucket
+    2208: (128, 448),  # + a 1 MP reference, 1024-row text bucket
+    2240: (128, 448),  # + a 1 MP reference, 2048-row text bucket
+    2304: (128, 576),  # + a 1 MP reference, 4096-row text bucket
+    1152: (128, 384),  # 4096x2304 / 2304x4096 image early stacks
+    1184: (128, 320),  # 1024-row text bucket
+    1216: (128, 320),  # 2048-row text bucket
+    1280: (128, 640),  # 4096-row text bucket
+    1312: (128, 448),  # + a 1 MP reference, 1024-row text bucket
+    1344: (128, 448),  # + a 1 MP reference, 2048-row text bucket
+    1408: (128, 704),  # + a 1 MP reference, 4096-row text bucket
+    1696: (128, 448),  # + a 4 MP reference, 1024-row text bucket
+    1728: (128, 576),  # + a 4 MP reference, 2048-row text bucket
+    1792: (128, 448),  # + a 4 MP reference, 4096-row text bucket
+    128: (128, 128),
+    64: (64, 64),
+    32: (32, 32),
+}
 # The ring all-gather keeps the CCL row's cores x < 4 with 2 links
 RING_SDPA_CCL_ROW_START_X = 4
 # linear1 (QKV + MLP-in as one all-gather matmul): N cores of its transposed grid, and the rows from which it runs
 LINEAR1_N_CORES = 9
 LINEAR1_MIN_ROWS = 8192
+LINEAR1_MIN_ROWS_SP32 = 2048
 
 
 class Flux3KleinAttention(Attention):
@@ -46,10 +71,11 @@ class Flux3KleinAttention(Attention):
     cores from RING_SDPA_CCL_ROW_START_X on, with RING_SDPA_CHUNKS_BY_LOCAL_ROWS's chunks where it has the rows."""
 
     def get_ring_sdpa_program_config(self, per_device_seq_len: int) -> ttnn.SDPAProgramConfig:
+        sp32 = self.parallel_config.sequence_parallel.factor == 32
         rows = per_device_seq_len // self.parallel_config.sequence_parallel.factor
         key = ("local", rows)
         if key not in self.ring_sdpa_program_config:
-            chunks = RING_SDPA_CHUNKS_BY_LOCAL_ROWS.get(rows)
+            chunks = (RING_SDPA_CHUNKS_SP32_BY_LOCAL_ROWS if sp32 else RING_SDPA_CHUNKS_BY_LOCAL_ROWS).get(rows)
             if chunks is None:
                 config = super().get_ring_sdpa_program_config(per_device_seq_len)
             else:
@@ -60,7 +86,7 @@ class Flux3KleinAttention(Attention):
                     exp_approx_mode=self.ring_sdpa_exp_approx,
                 )
             config.streaming_fp32_dest = True
-            config.ccl_row_sdpa_start_x = RING_SDPA_CCL_ROW_START_X
+            config.ccl_row_sdpa_start_x = None if sp32 else RING_SDPA_CCL_ROW_START_X
             self.ring_sdpa_program_config[key] = config
         return self.ring_sdpa_program_config[key]
 
@@ -148,6 +174,8 @@ class Flux3KleinTransformerBlock(Module):
         self._parallel_config = parallel_config
         self._mesh_device = device
         self._linear1 = linear1
+        sp32 = parallel_config.sequence_parallel.factor == 32
+        self._linear1_min_rows = LINEAR1_MIN_ROWS_SP32 if sp32 else LINEAR1_MIN_ROWS
         self._linear1_k_blocks: dict[int, int | None] = {}
         self._linear1_weight = None
         self._barrier_tile = None
@@ -271,7 +299,7 @@ class Flux3KleinTransformerBlock(Module):
         shift, scale_plus_one, gate = mod
         x_norm = ttnn.squeeze(self.norm(ttnn.unsqueeze(x, 0), dynamic_weight=scale_plus_one, dynamic_bias=shift), 0)
         rows = int(x_norm.padded_shape[-2])
-        k_block = self._linear1_k_block(rows) if self._linear1 and rows >= LINEAR1_MIN_ROWS else None
+        k_block = self._linear1_k_block(rows) if self._linear1 and rows >= self._linear1_min_rows else None
         if k_block is not None:
             q, k, v, mlp = self._linear1_qkv_mlp(x_norm, k_block)
             attn, _ = self.attn.forward(

@@ -139,19 +139,21 @@ class Flux2VaeDecoder(Module):
         m = self.bn_running_mean.data
         return z * s + m
 
-    def preprocess_and_unpatchify(self, z: ttnn.Tensor, *, height: int, width: int) -> ttnn.Tensor:
+    def preprocess_and_unpatchify(
+        self, z: ttnn.Tensor, *, height: int, width: int, h_factor: int | None = None
+    ) -> ttnn.Tensor:
         # N, (H / P) * (W / P), C * P * P -> N, H/h_factor, W, C
         # Input may be H-sharded (h_factor rows per device) or fully replicated.
         # W-sharding is applied by the caller after this call, once the spatial layout
         # is restored (H/W are interleaved in patchified tokens so W can't be split here).
+        # h_factor=1: the input is replicated even though the decoder is H-sharded (the caller splits the rows after).
         p = self._PATCH_SIZE
-        assert (
-            height % (p * self._ctx.h_factor) == 0
-        ), f"height {height} must be divisible by patch {p} * h_factor {self._ctx.h_factor}"
+        h_factor = self._ctx.h_factor if h_factor is None else h_factor
+        assert height % (p * h_factor) == 0, f"height {height} must be divisible by patch {p} * h_factor {h_factor}"
         assert (
             width % (p * self._ctx.w_factor) == 0
         ), f"width {width} must be divisible by patch {p} * w_factor {self._ctx.w_factor}"
-        height_local = height // self._ctx.h_factor
+        height_local = height // h_factor
 
         z = self._inv_normalize(z)
         z = ttnn.to_layout(z, ttnn.ROW_MAJOR_LAYOUT)

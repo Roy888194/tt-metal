@@ -190,12 +190,22 @@ class Flux3KleinVae:
             sliced = ttnn.slice(rows, [0, 0, 0], [1, h * w, LATENT_CHANNELS])
             ttnn.deallocate(rows)
             rows = sliced
-        parted = ttnn.mesh_partition(rows, dim=1, cluster_axis=self.h_axis, memory_config=rows.memory_config())
-        ttnn.deallocate(rows)
-        z = decoder.preprocess_and_unpatchify(parted, height=height // SCALE, width=width // SCALE)
-        ttnn.deallocate(parted)
-        rows = ttnn.to_layout(z, ttnn.ROW_MAJOR_LAYOUT)
-        ttnn.deallocate(z)
+        if h % int(self._device.shape[self.h_axis]) == 0:
+            parted = ttnn.mesh_partition(rows, dim=1, cluster_axis=self.h_axis, memory_config=rows.memory_config())
+            ttnn.deallocate(rows)
+            z = decoder.preprocess_and_unpatchify(parted, height=height // SCALE, width=width // SCALE)
+            ttnn.deallocate(parted)
+            rows = ttnn.to_layout(z, ttnn.ROW_MAJOR_LAYOUT)
+            ttnn.deallocate(z)
+        else:
+            # token rows that do not split over the h axis (144 at 2304 over 32 chips): unpatchify the gathered tokens,
+            # then split the latent rows (2 per token row)
+            z = decoder.preprocess_and_unpatchify(rows, height=height // SCALE, width=width // SCALE, h_factor=1)
+            ttnn.deallocate(rows)
+            full = ttnn.to_layout(z, ttnn.ROW_MAJOR_LAYOUT)
+            ttnn.deallocate(z)
+            rows = ttnn.mesh_partition(full, dim=1, cluster_axis=self.h_axis, memory_config=full.memory_config())
+            ttnn.deallocate(full)
         z = ttnn.mesh_partition(rows, dim=2, cluster_axis=self.w_axis, memory_config=rows.memory_config())
         ttnn.deallocate(rows)
         z = ttnn.to_layout(z, ttnn.TILE_LAYOUT)

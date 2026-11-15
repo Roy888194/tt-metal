@@ -88,7 +88,7 @@ class Flux3KleinRequest:
 
 @dataclass
 class Flux3KleinResult:
-    image: Image.Image
+    image: Image.Image | None  # None on the ranks other than 0 of a multi-host mesh
     prompt: str
     seed: int
     timings: dict[str, float]
@@ -170,9 +170,15 @@ def euler_update(x: ttnn.Tensor, velocity: ttnn.Tensor, dt: ttnn.Tensor, mask: t
 
 def image_to_uint8(image: ttnn.Tensor) -> ttnn.Tensor:
     """The reference's ((x + 1) * 127.5).clamp().to(uint8) on device, as one [1, H, W * 3] row per image row."""
+    return rows_to_uint8(image_rows(image))
+
+
+def image_rows(image: ttnn.Tensor) -> ttnn.Tensor:
     n, h, w, c = (int(d) for d in image.shape)
-    x = ttnn.to_layout(image, ttnn.ROW_MAJOR_LAYOUT)
-    x = ttnn.reshape(x, (n, h, w * c))
+    return ttnn.reshape(ttnn.to_layout(image, ttnn.ROW_MAJOR_LAYOUT), (n, h, w * c))
+
+
+def rows_to_uint8(x: ttnn.Tensor) -> ttnn.Tensor:
     x = ttnn.typecast(x, ttnn.float32)
     x = ttnn.add(x, 1.0)
     x = ttnn.multiply(x, 127.5)
@@ -348,10 +354,22 @@ class Flux3KleinPipeline:
         timings["decode"] = time.time() - t0
 
         t0 = time.time()
-        u8 = image_to_uint8(decoded)
-        rows = tensor.to_torch(u8, mesh_axes=[None, self._vae.h_axis, self._vae.w_axis])[0]
-        image = Image.fromarray(rows.reshape(height, width, 3).numpy())
-        ttnn.deallocate(u8)
+        if ttnn.using_distributed_env():
+            # across hosts rank 0 reads the image alone: the rows are gathered on device over the host axis, then
+            # converted; the other ranks get None
+            x = image_rows(decoded)
+            concat_dims: list[int | None] = [None, None]
+            concat_dims[self._vae.h_axis], concat_dims[self._vae.w_axis] = 1, 2
+            rows = tensor.fast_device_to_host(
+                x, self._device, concat_dims, ccl_manager=self._ccl, root=0, pre_transfer_fn=rows_to_uint8
+            )
+            rows = None if rows is None else rows[0]
+            ttnn.deallocate(x)
+        else:
+            u8 = image_to_uint8(decoded)
+            rows = tensor.to_torch(u8, mesh_axes=[None, self._vae.h_axis, self._vae.w_axis])[0]
+            ttnn.deallocate(u8)
+        image = None if rows is None else Image.fromarray(rows.reshape(height, width, 3).numpy())
         ttnn.deallocate(decoded)
         ttnn.deallocate(state)
         timings["to_host"] = time.time() - t0
