@@ -61,6 +61,8 @@ from .upsampler_flux3_klein import Flux3KleinSharedUpsampler, reserve_upsampler_
 from .weights_flux3_klein import resolve_weights_dir
 
 SIZES = tuple(side for side, _ in FLUX3_KLEIN_SERVING_SIZES)
+# (width, height): the served squares and the quad demo's 4096 x 2304 / 2304 x 4096
+SHAPES = (*FLUX3_KLEIN_SERVING_SIZES, (4096, 2304), (2304, 4096))
 DEFAULT_SIZE = FLUX3_KLEIN_DEFAULT_SIZE[0]
 MAX_REFERENCES = FLUX3_KLEIN_MAX_REFERENCES
 MATCH_MAX_PIXELS = FLUX3_KLEIN_REFERENCE_MAX_PIXELS
@@ -128,6 +130,11 @@ def prepare_reference(image: Image.Image) -> Image.Image:
     padding = ((top, h - image.height - top), (left, w - image.width - left), (0, 0))
     mode = "reflect" if min(image.size) > DOWNSAMPLING_RATIO else "symmetric"
     return Image.fromarray(np.pad(np.asarray(image), padding, mode=mode))
+
+
+def layout_buckets(width: int, height: int, ref_bucket: int) -> tuple[int, ...]:
+    """The text buckets a request of this layout picks from (TEXT_BUCKETS_BY_LAYOUT is keyed by square sides)."""
+    return TEXT_BUCKETS_BY_LAYOUT.get((width, ref_bucket), TEXT_BUCKETS) if width == height else TEXT_BUCKETS
 
 
 def reference_bucket(tokens: int) -> int:
@@ -239,7 +246,7 @@ class Flux3KleinPipeline:
             ccl_manager=CCLManager(mesh_device=mesh_device, num_links=num_links, topology=topology),
             dit_ccl_manager=self._ccl,
             dit_sp_axis=sp_axis,
-            sizes=SIZES,
+            sizes=SHAPES,
             tp_axis=tp_axis,
             h_axis=sp_axis,
         )
@@ -255,36 +262,38 @@ class Flux3KleinPipeline:
     def create(cls, mesh_device: ttnn.MeshDevice, *, models: tuple[str, ...] = ("distilled",), **kwargs):
         return cls(mesh_device, snapshots={model: resolve_weights_dir(model) for model in models}, **kwargs)
 
-    def warmup(self, sizes: tuple[int, ...] = SIZES) -> None:
-        """Compile every program of the served shapes: each size without a reference and with one per reference token
-        bucket (a square reference that fills the bucket), at each text bucket of that layout (a long prompt reaches the
-        larger ones), two steps each (every step runs the same programs). A reference of another shape reuses its
-        bucket's DiT programs; only the VAE encoder compiles for a new shape."""
+    def warmup(self, sizes: tuple[int | tuple[int, int], ...] = SHAPES) -> None:
+        """Compile every program of the served shapes (square sides or (width, height)): each shape without a reference
+        and with one per reference token bucket (a square reference that fills the bucket), at each text bucket of that
+        layout (a long prompt reaches the larger ones), two steps each (every step runs the same programs). A reference
+        of another shape reuses its bucket's DiT programs; only the VAE encoder compiles for a new shape."""
         for model in self._transformers:
-            for size in sizes:
+            for width, height in (size if isinstance(size, tuple) else (size, size) for size in sizes):
                 for bucket in (None, *REFERENCE_TOKEN_BUCKETS):
                     images = ()
                     if bucket is not None:
                         side = math.isqrt(bucket) * DOWNSAMPLING_RATIO
                         images = (Image.new("RGB", (side, side)),)
                     request = Flux3KleinRequest(
-                        WARMUP_PROMPT, model=model, width=size, height=size, seed=0, images=images, steps=2
+                        WARMUP_PROMPT, model=model, width=width, height=height, seed=0, images=images, steps=2
                     )
-                    for text_rows in TEXT_BUCKETS_BY_LAYOUT.get((size, bucket or 0), TEXT_BUCKETS):
+                    for text_rows in layout_buckets(width, height, bucket or 0):
                         self._generate(request, text_rows)
 
     def validate_request(self, request: Flux3KleinRequest) -> None:
         if request.model not in self._transformers:
             raise ValueError(f"model {request.model!r} is not loaded ({tuple(self._transformers)})")
-        if request.height != request.width or request.width not in SIZES:
-            raise ValueError(f"{request.width}x{request.height} is not one of the served sizes {SIZES} (square)")
+        if (request.width, request.height) not in SHAPES:
+            raise ValueError(
+                f"{request.width}x{request.height} is not one of the served shapes {SHAPES} (width, height)"
+            )
         if len(request.images) > MAX_REFERENCES:
             raise ValueError(f"at most {MAX_REFERENCES} reference image")
         if request.model == "distilled" and request.guidance not in (None, 1.0):
             raise ValueError("the distilled model takes no guidance")
 
-    def _text_rows(self, prompt: str, size: int, ref_bucket: int) -> int:
-        buckets = TEXT_BUCKETS_BY_LAYOUT.get((size, ref_bucket), TEXT_BUCKETS)
+    def _text_rows(self, prompt: str, width: int, height: int, ref_bucket: int) -> int:
+        buckets = layout_buckets(width, height, ref_bucket)
         return text_bucket(self._prompt_encoder.tokenize(prompt, MAX_TEXT_LENGTH)[2], buckets)
 
     def generate(self, request: Flux3KleinRequest) -> Flux3KleinResult:
@@ -292,7 +301,7 @@ class Flux3KleinPipeline:
 
     def _generate(self, request: Flux3KleinRequest, text_rows: int | None) -> Flux3KleinResult:
         self.validate_request(request)
-        size = request.width
+        width, height = request.width, request.height
         steps = request.steps or STEPS[request.model]
         guidance = GUIDANCE[request.model] if request.guidance is None else request.guidance
         guidance = None if request.model == "distilled" else guidance
@@ -315,7 +324,7 @@ class Flux3KleinPipeline:
         seed = caption_seed(prompt) if request.seed is None else request.seed
 
         t0 = time.time()
-        text = self._prompt_encoder.encode(prompt, text_rows or self._text_rows(prompt, size, ref_bucket))
+        text = self._prompt_encoder.encode(prompt, text_rows or self._text_rows(prompt, width, height, ref_bucket))
         timings["encode"] = time.time() - t0
 
         t0 = time.time()
@@ -326,7 +335,7 @@ class Flux3KleinPipeline:
         timings["encode_reference"] = time.time() - t0
 
         t0 = time.time()
-        h, w = latent_shape(size, size)
+        h, w = latent_shape(height, width)
         state, cached_steps = self._denoise(
             request.model, make_noise(seed, h, w), image_ids(h, w), text, image_cond, steps, guidance, request.cache
         )
@@ -334,19 +343,19 @@ class Flux3KleinPipeline:
         timings["denoise"] = time.time() - t0
 
         t0 = time.time()
-        decoded = self._vae.decode(state, size=size)
+        decoded = self._vae.decode(state, size=(width, height))
         ttnn.synchronize_device(self._device)
         timings["decode"] = time.time() - t0
 
         t0 = time.time()
         u8 = image_to_uint8(decoded)
         rows = tensor.to_torch(u8, mesh_axes=[None, self._vae.h_axis, self._vae.w_axis])[0]
-        image = Image.fromarray(rows.reshape(size, size, 3).numpy())
+        image = Image.fromarray(rows.reshape(height, width, 3).numpy())
         ttnn.deallocate(u8)
         ttnn.deallocate(decoded)
         ttnn.deallocate(state)
         timings["to_host"] = time.time() - t0
-        logger.info(f"FLUX 3 Klein {request.model} {size}x{size} refs {len(request.images)}: {timings}")
+        logger.info(f"FLUX 3 Klein {request.model} {width}x{height} refs {len(request.images)}: {timings}")
         return Flux3KleinResult(image=image, prompt=prompt, seed=seed, timings=timings, cached_steps=cached_steps)
 
     def _upload_rows(self, rows: torch.Tensor | ttnn.Tensor, sp_factor: int) -> ttnn.Tensor:

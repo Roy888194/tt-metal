@@ -45,10 +45,11 @@ PARTITIONED_DECODER_CONVS_PER_LEVEL = (
 
 
 def decoder_slice_params(sizes, h_factor: int, w_factor: int = 1) -> dict[tuple[int, int, int, int], int]:
-    """The decoder's conv slice table for square outputs of each size (the partitioned convs: 0, ttnn picks)."""
+    """The decoder's conv slice table for outputs of each size, a square side or (width, height) (the partitioned convs:
+    0, ttnn picks)."""
     table = {}
     for size in sizes:
-        h = w = size
+        w, h = size if isinstance(size, tuple) else (size, size)
         for level, partitioned in zip(CONV_SLICES_PER_LEVEL, PARTITIONED_DECODER_CONVS_PER_LEVEL):
             for (cin, cout), slices in level.items():
                 table.setdefault((h, w, cin, cout), min(slices, max(1, ttnn.core.divup(w, 32))))
@@ -109,7 +110,7 @@ class Flux3KleinVae:
         ccl_manager: CCLManager,
         dit_ccl_manager: CCLManager,
         dit_sp_axis: int,
-        sizes: tuple[int, ...],
+        sizes: tuple[int | tuple[int, int], ...],
         tp_axis: int = 0,
         h_axis: int = 1,
     ) -> None:
@@ -173,10 +174,11 @@ class Flux3KleinVae:
         self._bn_mean = state["bn.running_mean"].float()
         self._bn_std = torch.sqrt(state["bn.running_var"].float() + torch_vae.config.batch_norm_eps)
 
-    def decode(self, state: ttnn.Tensor, *, size: int) -> ttnn.Tensor:
-        """Decode the SP-sharded fp32 latent state of a size x size image to a [1, size, size, 3] image with its rows
-        sharded over `h_axis` and its columns over `w_axis`."""
-        h = w = size // (SCALE * PATCH)
+    def decode(self, state: ttnn.Tensor, *, size: int | tuple[int, int]) -> ttnn.Tensor:
+        """Decode the SP-sharded fp32 latent state of an image of ``size`` (a square side or (width, height)) to a
+        [1, height, width, 3] image with its rows sharded over `h_axis` and its columns over `w_axis`."""
+        width, height = size if isinstance(size, tuple) else (size, size)
+        h, w = height // (SCALE * PATCH), width // (SCALE * PATCH)
         decoder = self._decoder
 
         z = ttnn.typecast(state, ttnn.bfloat16)
@@ -190,7 +192,7 @@ class Flux3KleinVae:
             rows = sliced
         parted = ttnn.mesh_partition(rows, dim=1, cluster_axis=self.h_axis, memory_config=rows.memory_config())
         ttnn.deallocate(rows)
-        z = decoder.preprocess_and_unpatchify(parted, height=size // SCALE, width=size // SCALE)
+        z = decoder.preprocess_and_unpatchify(parted, height=height // SCALE, width=width // SCALE)
         ttnn.deallocate(parted)
         rows = ttnn.to_layout(z, ttnn.ROW_MAJOR_LAYOUT)
         ttnn.deallocate(z)
